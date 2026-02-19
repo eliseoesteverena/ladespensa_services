@@ -6,8 +6,7 @@
  * pertenece (auth vs app) y delegar. Sin lógica de negocio.
  *
  * Prefijos de ruta:
- *   /auth/*   → auth-module (auth-routes.js). Sin JWT propio — el módulo
- *               maneja su propia autenticación internamente.
+ *   /auth/*   → auth-module (worker.js del módulo, que tiene export default).
  *   /*        → app (nuestras rutas). JWT requerido en todas.
  *
  * Variables de entorno requeridas (ver wrangler.toml y .dev.vars.example):
@@ -19,9 +18,10 @@
  */
 
 // ── Auth-module ───────────────────────────────────────────────────────────────
-// Se importa solo auth-routes.js — el adaptador HTTP del módulo.
-// El core, crypto y persistence los usa auth-routes internamente.
-import authRoutes from './auth/routes/auth-routes.js';
+// Importamos el worker.js del auth-module, que sí tiene `export default`
+// con la forma { fetch, scheduled } esperada por Cloudflare Workers.
+// auth-routes.js solo tiene named exports internos — no se importa directamente.
+import authWorker from './auth/worker.js';
 
 // ── App middleware ────────────────────────────────────────────────────────────
 import { verifyAuth }            from './app/middleware/auth.js';
@@ -66,7 +66,7 @@ export default {
       const rewrittenUrl = new URL(request.url);
       rewrittenUrl.pathname = strippedPath;
       const rewrittenRequest = new Request(rewrittenUrl.toString(), request);
-      return authRoutes.fetch(rewrittenRequest, env, ctx);
+      return authWorker.fetch(rewrittenRequest, env, ctx);
     }
 
     // ── Bloque APP (/*) ───────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ export default {
 
   // ── Cron trigger: limpieza de sesiones expiradas (delegado al auth-module) ──
   async scheduled(event, env, ctx) {
-    return authRoutes.scheduled?.(event, env, ctx);
+    return authWorker.scheduled?.(event, env, ctx);
   }
 };
 

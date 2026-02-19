@@ -1,40 +1,35 @@
-name               = "casa-stock"
-main               = "src/worker.js"
-compatibility_date = "2025-01-01"
+name = "ladespensa-servicew"
+main = "src/worker.js"
+compatibility_date = "2026-02-19"
 
 # ── Base de datos D1 ──────────────────────────────────────────
 [[d1_databases]]
-binding       = "DB"
-database_name = "casa-stock-db"
-database_id   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # ← reemplazar tras: wrangler d1 create casa-stock-db
+binding = "DB"
+database_name = "ladespensa_db"
+database_id = "f124b1d2-21ca-4470-b07e-247745540909"
 
 # ── KV namespace para rate limiting (auth-module) ────────────
 [[kv_namespaces]]
-binding    = "AUTH_RATE_LIMIT_KV"
-id         = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"           # ← producción
-preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"           # ← desarrollo local
+binding = "AUTH_RATE_LIMIT_KV"
+id = "c49dd492057148859db7e2e7acd6a61b" 
 
 # ── Variables de entorno ──────────────────────────────────────
 [vars]
 # Auth
-JWT_ISSUER            = "casa-stock"
-JWT_AUDIENCE          = "casa-stock-api"
-ALLOWED_ORIGINS       = "http://localhost:3000"           # ← agregar dominio de producción separado por coma
-AUTH_BASE_PATH        = "/auth"                           # rutas auth en /auth/login, /auth/register, etc.
-VALID_ROLES           = "owner,admin,member,viewer"
-MAX_FAILED_ATTEMPTS   = "5"
-LOCKOUT_MINUTES       = "15"
-DEFAULT_TENANT_PLAN   = "basic"
+JWT_ISSUER = "ladespensa"
+JWT_AUDIENCE = "ladespensa-api"
+ALLOWED_ORIGINS = "http://localhost:3000" # ← agregar dominio de producción separado por coma
+AUTH_BASE_PATH = "" # el prefijo /auth lo maneja src/worker.js
+VALID_ROLES = "owner,admin,member,viewer"
+MAX_FAILED_ATTEMPTS = "5"
+LOCKOUT_MINUTES = "15"
+DEFAULT_TENANT_PLAN = "basic"
 DEFAULT_TENANT_STATUS = "active"
-DEFAULT_MAX_USERS     = "10"
+DEFAULT_MAX_USERS = "10"
 
 # App
-GEMINI_MODEL          = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # ── Cron trigger: limpieza de sesiones expiradas (auth) ──────
 [triggers]
 crons = ["0 3 * * *"]
-
-# ── Secrets (configurar con: wrangler secret put <NOMBRE>) ───
-# JWT_SECRET       → wrangler secret put JWT_SECRET
-# GEMINI_API_KEY   → wrangler secret put GEMINI_API_KEY
