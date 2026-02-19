@@ -1,0 +1,18 @@
+{
+  "name": "casa-stock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend de control de compras y stock doméstico — Cloudflare Workers + D1",
+  "main": "src/worker.js",
+  "type": "module",
+  "scripts": {
+    "dev":         "wrangler dev",
+    "deploy":      "wrangler deploy",
+    "db:local":    "wrangler d1 execute casa-stock-db --local --file=./db/01_auth_schema_v1.1.sql && wrangler d1 execute casa-stock-db --local --file=./db/02_business_schema_v2.sql",
+    "db:prod":     "wrangler d1 execute casa-stock-db --file=./db/01_auth_schema_v1.1.sql && wrangler d1 execute casa-stock-db --file=./db/02_business_schema_v2.sql",
+    "db:tables":   "wrangler d1 execute casa-stock-db --command=\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\""
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
