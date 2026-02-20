@@ -18,7 +18,7 @@ id = "c49dd492057148859db7e2e7acd6a61b"
 # Auth
 JWT_ISSUER = "ladespensa"
 JWT_AUDIENCE = "ladespensa-api"
-ALLOWED_ORIGINS = "http://localhost:3000" # ← agregar dominio de producción separado por coma
+ALLOWED_ORIGINS = "https://ladespensa-frontend.pages.dev" # ← agregar dominio de producción separado por coma
 AUTH_BASE_PATH = "" # el prefijo /auth lo maneja src/worker.js
 VALID_ROLES = "owner,admin,member,viewer"
 MAX_FAILED_ATTEMPTS = "5"
@@ -33,3 +33,18 @@ GEMINI_MODEL = "gemini-2.5-flash-lite"
 # ── Cron trigger: limpieza de sesiones expiradas (auth) ──────
 [triggers]
 crons = ["0 3 * * *"]
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
