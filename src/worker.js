@@ -3,45 +3,48 @@
  * Entry point único del worker. Router principal.
  *
  * Responsabilidad exclusiva: recibir el request, decidir a qué bloque
- * pertenece (auth vs app) y delegar. Sin lógica de negocio.
+ * pertenece y delegar. Sin lógica de negocio.
  *
  * Prefijos de ruta:
- *   /auth/*   → auth-module (worker.js del módulo, que tiene export default).
- *   /*        → app (nuestras rutas). JWT requerido en todas.
+ *   /auth/*          → auth-module (worker.js del módulo, export default)
+ *   /invitations/*   → públicas — info y aceptación de invitaciones (sin JWT)
+ *   /*               → app — JWT requerido en todas
  *
- * Variables de entorno requeridas (ver wrangler.toml y .dev.vars.example):
+ * Variables de entorno (ver wrangler.toml y .dev.vars.example):
  *   DB                  D1 binding
  *   JWT_SECRET          Secret HMAC compartido con auth-module
  *   GEMINI_API_KEY      Google AI Studio
  *   AUTH_RATE_LIMIT_KV  KV binding para rate limiting del auth-module
- *   AUTH_BASE_PATH      Debe ser "/auth" (configurado en wrangler.toml)
+ *   APP_FRONTEND_URL    URL base del frontend (para links de invitación)
  */
 
 // ── Auth-module ───────────────────────────────────────────────────────────────
-// Importamos el worker.js del auth-module, que sí tiene `export default`
-// con la forma { fetch, scheduled } esperada por Cloudflare Workers.
-// auth-routes.js solo tiene named exports internos — no se importa directamente.
 import authWorker from './auth/worker.js';
 
 // ── App middleware ────────────────────────────────────────────────────────────
-import { verifyAuth }            from './app/middleware/auth.js';
+import { verifyAuth }          from './app/middleware/auth.js';
 import { corsPreflightResponse,
          notFound,
-         serverError }           from './app/helpers/response.js';
+         serverError }         from './app/helpers/response.js';
 
-// ── App routes ────────────────────────────────────────────────────────────────
-import { handleScanEtiqueta }    from './app/routes/scan.routes.js';
+// ── Account routes ────────────────────────────────────────────────────────────
 import {
-  postCompra,
-  getCompras,
-  getCompraById,
-  getGastos
-}                                from './app/routes/compras.routes.js';
+  getMe, patchMe, patchPassword,
+  getWorkspace, patchWorkspace,
+  getMembers, patchMember, deleteMember,
+  getSessions, deleteSession,
+  getInvitations, postInvitation, deleteInvitation,
+  getInvitationInfo, postAcceptInvitation
+}                              from './app/routes/account.routes.js';
+
+// ── Domain routes ─────────────────────────────────────────────────────────────
+import { handleScanEtiqueta }  from './app/routes/scan.routes.js';
 import {
-  getStock,
-  getStockByTipo,
-  patchStock
-}                                from './app/routes/stock.routes.js';
+  postCompra, getCompras, getCompraById, getGastos
+}                              from './app/routes/compras.routes.js';
+import {
+  getStock, getStockByTipo, patchStock
+}                              from './app/routes/stock.routes.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -49,30 +52,32 @@ export default {
   async fetch(request, env, ctx) {
     const url    = new URL(request.url);
     const method = request.method.toUpperCase();
-    // Normalizar: quitar trailing slash salvo en "/"
     const path   = url.pathname.replace(/\/$/, '') || '/';
 
-    // ── CORS preflight — responder siempre, antes de cualquier otra cosa ─────
+    // CORS preflight — siempre antes de cualquier otra lógica
     if (method === 'OPTIONS') {
       return corsPreflightResponse(env.ALLOWED_ORIGINS);
     }
 
-    // ── Bloque AUTH (/auth/*) ─────────────────────────────────────────────────
-    // Se delega completamente a auth-routes.js del auth-module.
-    // Reescribimos el path quitando el prefijo /auth antes de pasar el request,
-    // porque auth-routes espera rutas sin prefijo (/login, /register, etc.).
+    // ── Auth (/auth/*) ────────────────────────────────────────────────────────
     if (path.startsWith('/auth')) {
-      const strippedPath = path.slice(5) || '/';          // "/auth/login" → "/login"
-      const rewrittenUrl = new URL(request.url);
+      const strippedPath    = path.slice(5) || '/';
+      const rewrittenUrl    = new URL(request.url);
       rewrittenUrl.pathname = strippedPath;
-      const rewrittenRequest = new Request(rewrittenUrl.toString(), request);
-      return authWorker.fetch(rewrittenRequest, env, ctx);
+      return authWorker.fetch(new Request(rewrittenUrl.toString(), request), env, ctx);
     }
 
-    // ── Bloque APP (/*) ───────────────────────────────────────────────────────
-    // Todas las rutas de la app requieren JWT válido.
+    // ── Invitaciones públicas (/invitations/*) — sin JWT ─────────────────────
+    if (path.startsWith('/invitations')) {
+      const publicCtx = { db: env.DB };
+      if (method === 'GET'  && path === '/invitations/info')   return getInvitationInfo(request, publicCtx);
+      if (method === 'POST' && path === '/invitations/accept') return postAcceptInvitation(request, publicCtx);
+      return notFound('Ruta');
+    }
+
+    // ── App (/*) — JWT requerido ──────────────────────────────────────────────
     const authResult = await verifyAuth(request, env);
-    if (authResult instanceof Response) return authResult;  // 401 si inválido
+    if (authResult instanceof Response) return authResult;
 
     const appCtx = {
       db:       env.DB,
@@ -89,7 +94,6 @@ export default {
     }
   },
 
-  // ── Cron trigger: limpieza de sesiones expiradas (delegado al auth-module) ──
   async scheduled(event, env, ctx) {
     return authWorker.scheduled?.(event, env, ctx);
   }
@@ -97,35 +101,72 @@ export default {
 
 // ─── Router de la app ─────────────────────────────────────────────────────────
 
-function routeApp(request, env, ctx, method, path) {
+function routeApp(request, env, appCtx, method, path) {
 
-  // ── Scan ────────────────────────────────────────────────────────────────────
-  if (method === 'POST' && path === '/scan-etiqueta') {
-    return handleScanEtiqueta(request, ctx, env);
+  // ── Account / perfil ──────────────────────────────────────────────────────
+  if (method === 'GET'   && path === '/account/me')            return getMe(request, appCtx);
+  if (method === 'PATCH' && path === '/account/me')            return patchMe(request, appCtx);
+  if (method === 'PATCH' && path === '/account/me/password')   return patchPassword(request, appCtx);
+
+  // ── Account / workspace ───────────────────────────────────────────────────
+  if (method === 'GET'   && path === '/account/workspace')     return getWorkspace(request, appCtx);
+  if (method === 'PATCH' && path === '/account/workspace')     return patchWorkspace(request, appCtx);
+
+  // ── Account / miembros ────────────────────────────────────────────────────
+  if (method === 'GET' && path === '/account/workspace/members') return getMembers(request, appCtx);
+
+  const memberMatch = path.match(/^\/account\/workspace\/members\/([^/]+)$/);
+  if (memberMatch) {
+    const [, targetUserId] = memberMatch;
+    if (method === 'PATCH')  return patchMember(request, appCtx, targetUserId);
+    if (method === 'DELETE') return deleteMember(request, appCtx, targetUserId);
   }
 
-  // ── Compras ─────────────────────────────────────────────────────────────────
-  // /compras/gastos debe evaluarse ANTES que /compras/:id
-  if (method === 'GET'  && path === '/compras/gastos') return getGastos(request, ctx);
-  if (method === 'POST' && path === '/compras')         return postCompra(request, ctx);
-  if (method === 'GET'  && path === '/compras')         return getCompras(request, ctx);
+  // ── Account / invitaciones ────────────────────────────────────────────────
+  if (method === 'GET'  && path === '/account/workspace/invitations') return getInvitations(request, appCtx);
+  if (method === 'POST' && path === '/account/workspace/invitations') return postInvitation(request, appCtx, env);
+
+  const invMatch = path.match(/^\/account\/workspace\/invitations\/([^/]+)$/);
+  if (invMatch) {
+    const [, invitationId] = invMatch;
+    if (method === 'DELETE') return deleteInvitation(request, appCtx, invitationId);
+  }
+
+  // ── Account / sesiones ────────────────────────────────────────────────────
+  if (method === 'GET' && path === '/account/sessions') return getSessions(request, appCtx);
+
+  const sessionMatch = path.match(/^\/account\/sessions\/([^/]+)$/);
+  if (sessionMatch) {
+    const [, jti] = sessionMatch;
+    if (method === 'DELETE') return deleteSession(request, appCtx, jti);
+  }
+
+  // ── Scan ──────────────────────────────────────────────────────────────────
+  if (method === 'POST' && path === '/scan-etiqueta') {
+    return handleScanEtiqueta(request, appCtx, env);
+  }
+
+  // ── Compras ───────────────────────────────────────────────────────────────
+  if (method === 'GET'  && path === '/compras/gastos') return getGastos(request, appCtx);
+  if (method === 'POST' && path === '/compras')         return postCompra(request, appCtx);
+  if (method === 'GET'  && path === '/compras')         return getCompras(request, appCtx);
 
   const compraMatch = path.match(/^\/compras\/([^/]+)$/);
   if (compraMatch) {
     const [, compraId] = compraMatch;
-    if (method === 'GET') return getCompraById(request, ctx, compraId);
+    if (method === 'GET') return getCompraById(request, appCtx, compraId);
   }
 
-  // ── Stock ────────────────────────────────────────────────────────────────────
-  if (method === 'GET' && path === '/stock') return getStock(request, ctx);
+  // ── Stock ─────────────────────────────────────────────────────────────────
+  if (method === 'GET' && path === '/stock') return getStock(request, appCtx);
 
   const stockMatch = path.match(/^\/stock\/([^/]+)$/);
   if (stockMatch) {
     const [, tipoId] = stockMatch;
-    if (method === 'GET')   return getStockByTipo(request, ctx, tipoId);
-    if (method === 'PATCH') return patchStock(request, ctx, tipoId);
+    if (method === 'GET')   return getStockByTipo(request, appCtx, tipoId);
+    if (method === 'PATCH') return patchStock(request, appCtx, tipoId);
   }
 
-  // ── 404 ──────────────────────────────────────────────────────────────────────
+  // ── 404 ───────────────────────────────────────────────────────────────────
   return notFound('Ruta');
 }
