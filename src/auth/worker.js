@@ -1,6 +1,6 @@
 /**
- * Cloudflare Worker — Auth Service (DEBUG VERSION)
- * Con logging detallado para rastrear errores en dashboard
+ * Cloudflare Worker — Auth Service (FIXED)
+ * Body parseado una sola vez y pasado a los handlers
  */
 
 import { UserRepository }     from './persistence/user-repository.js';
@@ -121,21 +121,18 @@ export default {
       }
 
       // ═══════════════════════════════════════════════════════════════════
-      // REGISTER — con logging detallado
+      // REGISTER — leer body UNA SOLA VEZ y pasarlo al handler
       // ═══════════════════════════════════════════════════════════════════
       if (path === `${base}/register` && method === 'POST') {
-        console.log('🔵 [REGISTER] Iniciando registro');
-        
         let body;
         try {
           body = await request.json();
-          console.log('🔵 [REGISTER] Body recibido:', JSON.stringify({
-            email: body.email ? '***' : undefined,
-            hasPassword: !!body.password,
-            workspace_name: body.workspace_name,
-            tenant_id: body.tenant_id,
-            role: body.role
-          }));
+          console.log('🔵 [REGISTER] Body parseado:', {
+            email: body.email ? 'presente' : 'ausente',
+            password: body.password ? 'presente' : 'ausente',
+            workspace_name: body.workspace_name || 'ausente',
+            tenant_id: body.tenant_id || 'ausente'
+          });
         } catch (parseError) {
           console.error('🔴 [REGISTER] Error parseando JSON:', parseError.message);
           response = jsonResponse({ error: 'Invalid JSON in request body' }, 400);
@@ -143,32 +140,39 @@ export default {
         }
 
         try {
-          console.log('🔵 [REGISTER] Llamando a authRoutes.handleRegister()');
-          const result = await authRoutes.handleRegister(request, ctx);
-          console.log('🟢 [REGISTER] Respuesta exitosa, status:', result.status);
+          // ✅ Pasar el body ya parseado
+          const result = await authRoutes.handleRegisterWithBody(body, request, ctx);
+          console.log('🟢 [REGISTER] Registro exitoso');
           response = jsonResponse(result.data, result.status);
-        } catch (handleError) {
-          console.error('🔴 [REGISTER] Error en handleRegister:', {
-            message: handleError.message,
-            stack: handleError.stack,
-            statusCode: handleError.statusCode,
-            data: handleError.data
-          });
-          
-          // Re-leer el body porque ya fue consumido
+        } catch (error) {
+          console.error('🔴 [REGISTER] Error:', error.message);
           const errorBody = {
-            error: handleError.message || 'Registration failed',
-            ...(handleError.data || {})
+            error: error.message || 'Registration failed',
+            ...(error.data || {})
           };
-          response = jsonResponse(errorBody, handleError.statusCode || 500);
+          response = jsonResponse(errorBody, error.statusCode || 500);
         }
       }
       else if (path === `${base}/login` && method === 'POST') {
-        const result = await authRoutes.handleLogin(request, ctx);
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          response = jsonResponse({ error: 'Invalid JSON in request body' }, 400);
+          return cors.addHeaders(response, request);
+        }
+        const result = await authRoutes.handleLoginWithBody(body, request, ctx);
         response = jsonResponse(result.data, result.status);
       }
       else if (path === `${base}/refresh` && method === 'POST') {
-        const result = await authRoutes.handleRefresh(request, ctx);
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          response = jsonResponse({ error: 'Invalid JSON in request body' }, 400);
+          return cors.addHeaders(response, request);
+        }
+        const result = await authRoutes.handleRefreshWithBody(body, request, ctx);
         response = jsonResponse(result.data, result.status);
       }
       else if (path === `${base}/logout` && method === 'POST') {
@@ -203,11 +207,7 @@ export default {
       return cors.addHeaders(response, request);
 
     } catch (error) {
-      console.error('🔴 [WORKER] Error no capturado:', {
-        message: error.message,
-        stack: error.stack,
-        name: error.name
-      });
+      console.error('🔴 [WORKER] Error no capturado:', error.message, error.stack);
       const errResponse = jsonResponse(
         { error: 'Internal server error', message: error.message },
         500
