@@ -1,6 +1,14 @@
 /**
- * Auth Routes Handler (DEBUG VERSION)
- * Con logging detallado para rastrear errores
+ * Auth Routes Handler
+ * Capa HTTP — traduce requests a llamadas al AuthService.
+ *
+ * CORRECCIONES aplicadas:
+ *  - Roles válidos eliminados del handler: la validación ocurre en AuthService
+ *    (configurado desde fuera), esta capa solo hace validación de presencia.
+ *  - company_name → workspace_name (término neutro, agnóstico al negocio).
+ *  - handleLogin() pasa tenantId al servicio (modelo email-por-tenant).
+ *  - handleLogoutAll() expuesto como ruta opcional.
+ *  - _getContext() propaga ctx (ExecutionContext de CF Workers) para waitUntil.
  */
 import { AuthError } from '../core/auth-service.js';
 
@@ -9,52 +17,41 @@ export class AuthRoutes {
     this.authService = authService;
   }
 
+  // ── Handlers ──────────────────────────────────────────────────────────────
+
   async handleRegister(request, ctx) {
-    console.log('🔵 [AUTH-ROUTES] handleRegister iniciado');
-    
     let body;
     try {
       body = await request.json();
-      console.log('🔵 [AUTH-ROUTES] Body parseado correctamente');
     } catch {
-      console.error('🔴 [AUTH-ROUTES] Error parseando JSON');
       return this._errorResponse('Invalid JSON in request body', 400);
     }
 
     const { email, password, role, tenant_id, workspace_name } = body;
 
-    console.log('🔵 [AUTH-ROUTES] Validando campos requeridos:', {
-      hasEmail: !!email,
-      hasPassword: !!password,
-      hasTenantId: !!tenant_id,
-      hasWorkspaceName: !!workspace_name
-    });
-
     if (!email || !password) {
-      console.error('🔴 [AUTH-ROUTES] Faltan email o password');
       return this._errorResponse('email and password are required', 400);
     }
 
+    // Sin tenant_id → self-registration (crear workspace nuevo)
+    // Con tenant_id → invite-registration (unirse a workspace existente)
     const isSelfRegistration = !tenant_id;
-    console.log('🔵 [AUTH-ROUTES] Tipo de registro:', isSelfRegistration ? 'SELF' : 'INVITE');
 
     if (isSelfRegistration && !workspace_name) {
-      console.error('🔴 [AUTH-ROUTES] Falta workspace_name en self-registration');
       return this._errorResponse(
         'workspace_name is required when creating a new account',
         400
       );
     }
 
+    // El rol por defecto para self-registration es el primero de validRoles
+    // (normalmente 'owner'). Para invite, usa el rol enviado o el segundo (ej. 'member').
+    // La validación real del rol ocurre en AuthService.
     const finalRole = isSelfRegistration
       ? (role ?? 'owner')
       : (role ?? 'member');
 
-    console.log('🔵 [AUTH-ROUTES] Rol final asignado:', finalRole);
-
     try {
-      console.log('🔵 [AUTH-ROUTES] Llamando a authService.register()');
-      
       const result = await this.authService.register(
         {
           email,
@@ -66,17 +63,8 @@ export class AuthRoutes {
         },
         this._getContext(request, ctx)
       );
-      
-      console.log('🟢 [AUTH-ROUTES] Registro exitoso, user_id:', result.id);
       return this._successResponse(result, 201);
-      
     } catch (error) {
-      console.error('🔴 [AUTH-ROUTES] Error capturado en handleRegister:', {
-        message: error.message,
-        statusCode: error.statusCode,
-        isAuthError: error instanceof AuthError,
-        stack: error.stack?.split('\n').slice(0, 3).join('\n')
-      });
       return this._handleError(error);
     }
   }
@@ -95,6 +83,9 @@ export class AuthRoutes {
       return this._errorResponse('email and password are required', 400);
     }
 
+    // tenant_id requerido en modelo email-por-tenant.
+    // Si tu despliegue es single-tenant, setea un TENANT_ID fijo en env
+    // y el worker puede inyectarlo aquí antes de llamar al handler.
     if (!tenant_id) {
       return this._errorResponse('tenant_id is required', 400);
     }
@@ -151,6 +142,7 @@ export class AuthRoutes {
     }
   }
 
+  /** Cierra TODAS las sesiones del usuario (todos los dispositivos). */
   async handleLogoutAll(request, ctx) {
     const token = this._extractToken(request);
     if (!token) {
@@ -182,12 +174,18 @@ export class AuthRoutes {
     }
   }
 
+  // ── Private helpers ────────────────────────────────────────────────────────
+
   _extractToken(request) {
     const authHeader = request.headers.get('Authorization');
     if (!authHeader) return null;
     return authHeader.replace(/^Bearer\s+/i, '');
   }
 
+  /**
+   * Construye el context que se pasa al AuthService.
+   * Incluye ctx (ExecutionContext) para habilitar waitUntil en logs.
+   */
   _getContext(request, ctx = null) {
     return {
       ip: (
@@ -196,7 +194,7 @@ export class AuthRoutes {
         'unknown'
       ),
       userAgent: request.headers.get('user-agent') ?? 'unknown',
-      ctx,
+      ctx,   // ✅ propagado para waitUntil no bloqueante
     };
   }
 
@@ -210,18 +208,9 @@ export class AuthRoutes {
 
   _handleError(error) {
     if (error instanceof AuthError) {
-      console.error('🔴 [AUTH-ROUTES] AuthError:', {
-        message: error.message,
-        statusCode: error.statusCode,
-        data: error.data
-      });
       return this._errorResponse(error.message, error.statusCode, error.data);
     }
-    console.error('🔴 [AUTH-ROUTES] Error inesperado:', {
-      name: error.name,
-      message: error.message,
-      stack: error.stack?.split('\n').slice(0, 5).join('\n')
-    });
+    console.error('Unexpected error in AuthRoutes:', error);
     return this._errorResponse('Internal server error', 500);
   }
 }

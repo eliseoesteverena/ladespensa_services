@@ -1,6 +1,31 @@
 /**
- * Cloudflare Worker — Auth Service (DEBUG VERSION)
- * Con logging detallado para rastrear errores en dashboard
+ * Cloudflare Worker — Auth Service
+ * Entry point con dependency injection y manejo de rutas.
+ *
+ * CORRECCIONES aplicadas:
+ *  - TenantRepository importado e inyectado en AuthService.
+ *  - _initializeDependencies() movido fuera de fetch() con lazy init
+ *    para no recrear instancias stateless en cada request.
+ *  - RateLimitMiddleware recibe env.AUTH_RATE_LIMIT_KV y se aplica
+ *    en las rutas sensibles (/login, /register).
+ *  - CORS origins desde env.ALLOWED_ORIGINS (no más wildcard hardcodeado).
+ *  - JWT issuer/audience desde env.JWT_ISSUER y env.JWT_AUDIENCE.
+ *  - Roles y tenantDefaults configurables desde env.
+ *  - ctx propagado a AuthRoutes para waitUntil no bloqueante.
+ *  - Handler scheduled() para limpieza diaria de sesiones expiradas.
+ *  - /logout-all como ruta separada de /logout.
+ *  - Rutas sin prefijo duplicado: basePath configurable via env.AUTH_BASE_PATH.
+ *
+ * VARIABLES DE ENTORNO requeridas (ver wrangler.toml):
+ *   JWT_SECRET         — secret HMAC para firmar tokens (wrangler secret put)
+ *   JWT_ISSUER         — issuer del JWT (ej. "mi-app")
+ *   JWT_AUDIENCE       — audience del JWT (ej. "mi-api")
+ *   ALLOWED_ORIGINS    — orígenes CORS separados por coma (ej. "https://app.com")
+ *   AUTH_BASE_PATH     — prefijo de rutas (ej. "/auth" o "") [opcional, default: ""]
+ *
+ * BINDINGS requeridos:
+ *   DB                     — D1 database
+ *   AUTH_RATE_LIMIT_KV     — KV namespace para rate limiting
  */
 
 import { UserRepository }     from './persistence/user-repository.js';
@@ -15,6 +40,10 @@ import { AuthRoutes }         from './routes/auth-routes.js';
 import { CorsMiddleware }     from './middleware/cors.js';
 import { RateLimitMiddleware } from './middleware/rate-limit.js';
 
+// ── Lazy init ─────────────────────────────────────────────────────────────────
+// Las dependencias stateless (crypto services, middleware de config) se crean
+// una sola vez por isolate. Los repositories que dependen de env.DB se
+// instancian por request porque D1 es per-request en Workers.
 let _staticDeps = null;
 
 function getStaticDeps(env) {
@@ -30,9 +59,10 @@ function getStaticDeps(env) {
     expiryDays:  30,
   });
 
+  // ✅ CORS desde env — nunca wildcard en producción para auth
   const allowedOrigins = env.ALLOWED_ORIGINS
     ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-    : ['*'];
+    : ['*']; // solo para desarrollo local
 
   const cors = new CorsMiddleware({
     allowedOrigins,
@@ -44,20 +74,24 @@ function getStaticDeps(env) {
   return _staticDeps;
 }
 
+/** Construye todas las dependencias para un request (repositories son per-request). */
 function buildDeps(env) {
   const { passwordService, jwtService, refreshTokenService, cors } = getStaticDeps(env);
 
+  // Repositories (usan env.DB que es per-request en D1)
   const userRepo    = new UserRepository(env.DB);
   const tenantRepo  = new TenantRepository(env.DB);
   const sessionRepo = new SessionRepository(env.DB);
   const authLogRepo = new AuthLogRepository(env.DB);
 
+  // ✅ Rate limiter con KV real
   const rateLimit = new RateLimitMiddleware({
     kv:          env.AUTH_RATE_LIMIT_KV,
-    windowMs:    15 * 60 * 1000,
+    windowMs:    15 * 60 * 1000, // 15 min
     maxRequests: 100,
   });
 
+  // Parsear roles válidos desde env (ej. "owner,admin,member,viewer")
   const validRoles = env.VALID_ROLES
     ? env.VALID_ROLES.split(',').map(r => r.trim())
     : ['owner', 'admin', 'member', 'viewer'];
@@ -87,6 +121,7 @@ function buildDeps(env) {
   return { authRoutes, cors, rateLimit, jwtService };
 }
 
+// ── Worker export ─────────────────────────────────────────────────────────────
 export default {
 
   async fetch(request, env, ctx) {
@@ -97,6 +132,7 @@ export default {
     const method = request.method;
     const base   = env.AUTH_BASE_PATH ?? '';
 
+    // Preflight CORS
     if (method === 'OPTIONS') {
       return cors.handlePreflight(request);
     }
@@ -104,15 +140,18 @@ export default {
     try {
       let response;
 
+      // ── Health check ────────────────────────────────────────────────────
       if (path === `${base}/health` && method === 'GET') {
         response = jsonResponse({ status: 'ok', timestamp: new Date().toISOString() });
         return cors.addHeaders(response, request);
       }
 
+      // ── Rutas públicas con rate limiting ────────────────────────────────
       const isPublicAuthRoute =
         (path === `${base}/register` || path === `${base}/login`) && method === 'POST';
 
       if (isPublicAuthRoute) {
+        // ✅ Rate limit aplicado en las rutas más sensibles
         const rl = await rateLimit.checkLimit(request);
         if (!rl.allowed) {
           response = rateLimit.rateLimitResponse(rl.resetAt);
@@ -120,48 +159,10 @@ export default {
         }
       }
 
-      // ═══════════════════════════════════════════════════════════════════
-      // REGISTER — con logging detallado
-      // ═══════════════════════════════════════════════════════════════════
+      // ── Auth routes ─────────────────────────────────────────────────────
       if (path === `${base}/register` && method === 'POST') {
-        console.log('🔵 [REGISTER] Iniciando registro');
-        
-        let body;
-        try {
-          body = await request.json();
-          console.log('🔵 [REGISTER] Body recibido:', JSON.stringify({
-            email: body.email ? '***' : undefined,
-            hasPassword: !!body.password,
-            workspace_name: body.workspace_name,
-            tenant_id: body.tenant_id,
-            role: body.role
-          }));
-        } catch (parseError) {
-          console.error('🔴 [REGISTER] Error parseando JSON:', parseError.message);
-          response = jsonResponse({ error: 'Invalid JSON in request body' }, 400);
-          return cors.addHeaders(response, request);
-        }
-
-        try {
-          console.log('🔵 [REGISTER] Llamando a authRoutes.handleRegister()');
-          const result = await authRoutes.handleRegister(request, ctx);
-          console.log('🟢 [REGISTER] Respuesta exitosa, status:', result.status);
-          response = jsonResponse(result.data, result.status);
-        } catch (handleError) {
-          console.error('🔴 [REGISTER] Error en handleRegister:', {
-            message: handleError.message,
-            stack: handleError.stack,
-            statusCode: handleError.statusCode,
-            data: handleError.data
-          });
-          
-          // Re-leer el body porque ya fue consumido
-          const errorBody = {
-            error: handleError.message || 'Registration failed',
-            ...(handleError.data || {})
-          };
-          response = jsonResponse(errorBody, handleError.statusCode || 500);
-        }
+        const result = await authRoutes.handleRegister(request, ctx);
+        response = jsonResponse(result.data, result.status);
       }
       else if (path === `${base}/login` && method === 'POST') {
         const result = await authRoutes.handleLogin(request, ctx);
@@ -183,6 +184,10 @@ export default {
         const result = await authRoutes.handleVerify(request);
         response = jsonResponse(result.data, result.status);
       }
+
+      // ── Rutas protegidas /api/* ──────────────────────────────────────────
+      // Aquí va la lógica de tu proyecto. El middleware de verificación
+      // decodifica el JWT y lo pone en request.authContext.
       else if (path.startsWith(`${base}/api/`)) {
         const token = extractToken(request);
         if (!token) {
@@ -194,8 +199,11 @@ export default {
           response = jsonResponse({ error: 'Invalid or expired token' }, 401);
           return cors.addHeaders(response, request);
         }
+        // → aquí tu router de negocio puede usar verification.payload
         response = jsonResponse({ error: 'Route not found', path, method }, 404);
       }
+
+      // ── 404 ─────────────────────────────────────────────────────────────
       else {
         response = jsonResponse({ error: 'Route not found', path, method }, 404);
       }
@@ -203,11 +211,8 @@ export default {
       return cors.addHeaders(response, request);
 
     } catch (error) {
-      console.error('🔴 [WORKER] Error no capturado:', {
-        message: error.message,
-        stack: error.stack,
-        name: error.name
-      });
+      console.error('Worker error:', error.message);
+      console.error(error.stack);
       const errResponse = jsonResponse(
         { error: 'Internal server error', message: error.message },
         500
@@ -216,11 +221,19 @@ export default {
     }
   },
 
+  /**
+   * ✅ Scheduled handler — limpieza diaria de sesiones expiradas.
+   * Configurar en wrangler.toml:
+   *   [triggers]
+   *   crons = ["0 3 * * *"]
+   */
   async scheduled(_event, env, ctx) {
     const sessionRepo = new SessionRepository(env.DB);
     ctx.waitUntil(sessionRepo.cleanupExpired());
   },
 };
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
