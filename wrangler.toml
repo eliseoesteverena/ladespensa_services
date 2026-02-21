@@ -31,8 +31,8 @@ DEFAULT_MAX_USERS = "10"
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # ── Cron trigger: limpieza de sesiones expiradas (auth) ──────
-[triggers]
-crons = ["0 3 * * *"]
+# [triggers]
+# crons = ["0 3 * * *"]
 
 [observability]
 enabled = false
