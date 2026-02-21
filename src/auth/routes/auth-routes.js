@@ -1,6 +1,6 @@
 /**
- * Auth Routes Handler (DEBUG VERSION)
- * Con logging detallado para rastrear errores
+ * Auth Routes Handler (FIXED)
+ * Métodos *WithBody() para recibir el body ya parseado desde el worker
  */
 import { AuthError } from '../core/auth-service.js';
 
@@ -9,47 +9,20 @@ export class AuthRoutes {
     this.authService = authService;
   }
 
-  async handleRegister(request, ctx) {
-    console.log('🔵 [AUTH-ROUTES] handleRegister iniciado');
-    
-    let body;
-    try {
-      body = await request.json();
-      console.log('🔵 [AUTH-ROUTES] Body parseado correctamente');
-    } catch {
-      console.error('🔴 [AUTH-ROUTES] Error parseando JSON');
-      return this._errorResponse('Invalid JSON in request body', 400);
-    }
+  // ══════════════════════════════════════════════════════════════════════
+  // NUEVOS MÉTODOS — reciben el body ya parseado
+  // ══════════════════════════════════════════════════════════════════════
 
+  async handleRegisterWithBody(body, request, ctx) {
     const { email, password, role, tenant_id, workspace_name } = body;
 
-// 👇 AÑADIR ESTE LOG:
-console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
-  email: email ? '✓' : '✗',
-  password: password ? '✓' : '✗',
-  tenant_id: tenant_id || 'null',
-  workspace_name: workspace_name || 'UNDEFINED',
-  role: role || 'null',
-  bodyKeys: Object.keys(body) // 👈 esto te muestra TODOS los campos que llegaron
-});
-
-    console.log('🔵 [AUTH-ROUTES] Validando campos requeridos:', {
-      hasEmail: !!email,
-      hasPassword: !!password,
-      hasTenantId: !!tenant_id,
-      hasWorkspaceName: !!workspace_name
-    });
-
     if (!email || !password) {
-      console.error('🔴 [AUTH-ROUTES] Faltan email o password');
       return this._errorResponse('email and password are required', 400);
     }
 
     const isSelfRegistration = !tenant_id;
-    console.log('🔵 [AUTH-ROUTES] Tipo de registro:', isSelfRegistration ? 'SELF' : 'INVITE');
 
     if (isSelfRegistration && !workspace_name) {
-      console.error('🔴 [AUTH-ROUTES] Falta workspace_name en self-registration');
       return this._errorResponse(
         'workspace_name is required when creating a new account',
         400
@@ -60,11 +33,7 @@ console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
       ? (role ?? 'owner')
       : (role ?? 'member');
 
-    console.log('🔵 [AUTH-ROUTES] Rol final asignado:', finalRole);
-
     try {
-      console.log('🔵 [AUTH-ROUTES] Llamando a authService.register()');
-      
       const result = await this.authService.register(
         {
           email,
@@ -77,28 +46,15 @@ console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
         this._getContext(request, ctx)
       );
       
-      console.log('🟢 [AUTH-ROUTES] Registro exitoso, user_id:', result.id);
       return this._successResponse(result, 201);
       
     } catch (error) {
-      console.error('🔴 [AUTH-ROUTES] Error capturado en handleRegister:', {
-        message: error.message,
-        statusCode: error.statusCode,
-        isAuthError: error instanceof AuthError,
-        stack: error.stack?.split('\n').slice(0, 3).join('\n')
-      });
+      console.error('🔴 [AUTH-ROUTES] Error en register:', error.message);
       return this._handleError(error);
     }
   }
 
-  async handleLogin(request, ctx) {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return this._errorResponse('Invalid JSON in request body', 400);
-    }
-
+  async handleLoginWithBody(body, request, ctx) {
     const { email, password, tenant_id } = body;
 
     if (!email || !password) {
@@ -120,14 +76,7 @@ console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
     }
   }
 
-  async handleRefresh(request, ctx) {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return this._errorResponse('Invalid JSON in request body', 400);
-    }
-
+  async handleRefreshWithBody(body, request, ctx) {
     const { refresh_token } = body;
     if (!refresh_token) {
       return this._errorResponse('refresh_token is required', 400);
@@ -142,6 +91,40 @@ console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
     } catch (error) {
       return this._handleError(error);
     }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // MÉTODOS ORIGINALES — mantienen retrocompatibilidad (leen el body ellos)
+  // ══════════════════════════════════════════════════════════════════════
+
+  async handleRegister(request, ctx) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return this._errorResponse('Invalid JSON in request body', 400);
+    }
+    return this.handleRegisterWithBody(body, request, ctx);
+  }
+
+  async handleLogin(request, ctx) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return this._errorResponse('Invalid JSON in request body', 400);
+    }
+    return this.handleLoginWithBody(body, request, ctx);
+  }
+
+  async handleRefresh(request, ctx) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return this._errorResponse('Invalid JSON in request body', 400);
+    }
+    return this.handleRefreshWithBody(body, request, ctx);
   }
 
   async handleLogout(request, ctx) {
@@ -192,6 +175,10 @@ console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════
+  // HELPERS
+  // ══════════════════════════════════════════════════════════════════════
+
   _extractToken(request) {
     const authHeader = request.headers.get('Authorization');
     if (!authHeader) return null;
@@ -220,18 +207,9 @@ console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
 
   _handleError(error) {
     if (error instanceof AuthError) {
-      console.error('🔴 [AUTH-ROUTES] AuthError:', {
-        message: error.message,
-        statusCode: error.statusCode,
-        data: error.data
-      });
       return this._errorResponse(error.message, error.statusCode, error.data);
     }
-    console.error('🔴 [AUTH-ROUTES] Error inesperado:', {
-      name: error.name,
-      message: error.message,
-      stack: error.stack?.split('\n').slice(0, 5).join('\n')
-    });
+    console.error('🔴 [AUTH-ROUTES] Unexpected error:', error.message);
     return this._errorResponse('Internal server error', 500);
   }
 }

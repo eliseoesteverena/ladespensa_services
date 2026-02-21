@@ -1,8 +1,35 @@
 /**
- * Authentication Service (FIXED)
- * Regex de caracteres especiales expandido para incluir guiones y más símbolos comunes
+ * Authentication Service
+ * Core business logic — agnóstico al dominio de negocio.
+ *
+ * CORRECCIONES aplicadas:
+ *  - _generateId() → crypto.randomUUID() (criptográficamente seguro)
+ *  - Roles configurables via config.validRoles (no hardcodeados)
+ *  - Defaults de tenant via config.tenantDefaults (no hardcodeados)
+ *  - tenantRepo separado de userRepo (inyectado como dependencia nueva)
+ *  - Registro tenant+usuario usa D1 batch() → operación atómica
+ *  - Logout revoca solo la sesión actual (por jti), no todas las sesiones
+ *  - findByEmail() recibe tenantId → modelo email único por tenant
+ *  - login() requiere tenant_id en las credenciales para resolver el usuario
+ *  - isAccountLocked() e isTenantActive() ahora son síncronos (no async)
+ *  - ctx.waitUntil propagado para logging no bloqueante (opcional)
  */
 export class AuthService {
+  /**
+   * @param {object} dependencies
+   * @param {import('../persistence/user-repository.js').UserRepository}   dependencies.userRepo
+   * @param {import('../persistence/tenant-repository.js').TenantRepository} dependencies.tenantRepo
+   * @param {import('../persistence/session-repository.js').SessionRepository} dependencies.sessionRepo
+   * @param {import('../persistence/auth-log-repository.js').AuthLogRepository} dependencies.authLogRepo
+   * @param {object} dependencies.passwordService
+   * @param {object} dependencies.jwtService
+   * @param {object} dependencies.refreshTokenService
+   * @param {object} [dependencies.config]
+   * @param {number}   [dependencies.config.maxFailedAttempts=5]
+   * @param {number}   [dependencies.config.lockoutMinutes=15]
+   * @param {string[]} [dependencies.config.validRoles]          ← configurable
+   * @param {object}   [dependencies.config.tenantDefaults]      ← configurable
+   */
   constructor(dependencies) {
     this.userRepo            = dependencies.userRepo;
     this.tenantRepo          = dependencies.tenantRepo;
@@ -16,7 +43,11 @@ export class AuthService {
 
     this.maxFailedAttempts = cfg.maxFailedAttempts ?? 5;
     this.lockoutMinutes    = cfg.lockoutMinutes    ?? 15;
+
+    // ✅ Roles configurables — sin vocabulario de negocio hardcodeado
     this.validRoles = cfg.validRoles ?? ['owner', 'admin', 'member', 'viewer'];
+
+    // ✅ Defaults de tenant configurables
     this.tenantDefaults = {
       plan:     'basic',
       status:   'active',
@@ -25,6 +56,26 @@ export class AuthService {
     };
   }
 
+  // ── PUBLIC API ─────────────────────────────────────────────────────────────
+
+  /**
+   * Registrar un nuevo usuario.
+   * Soporta dos flujos:
+   *   - Self-registration (isSelfRegistration=true): crea tenant + usuario en batch atómico.
+   *   - Invite-registration (isSelfRegistration=false): agrega usuario a tenant existente.
+   *
+   * @param {object} userData
+   * @param {string}  userData.email
+   * @param {string}  userData.password
+   * @param {string}  userData.role
+   * @param {string}  [userData.tenantId]          - requerido si !isSelfRegistration
+   * @param {string}  [userData.workspaceName]     - requerido si isSelfRegistration
+   * @param {boolean} userData.isSelfRegistration
+   * @param {object} context
+   * @param {string}  context.ip
+   * @param {string}  context.userAgent
+   * @param {ExecutionContext} [context.ctx]        - CF Workers ctx para waitUntil
+   */
   async register(userData, context) {
     const {
       email,
@@ -36,6 +87,7 @@ export class AuthService {
     } = userData;
     const { ip, userAgent, ctx } = context;
 
+    // Validar rol
     if (!this.validRoles.includes(role)) {
       throw new AuthError(
         `Invalid role. Must be one of: ${this.validRoles.join(', ')}`,
@@ -46,6 +98,7 @@ export class AuthService {
     let finalTenantId = tenantId;
 
     if (isSelfRegistration) {
+      // ── SELF-REGISTRATION ────────────────────────────────────────────────
       finalTenantId = crypto.randomUUID();
 
       const tenantData = {
@@ -58,12 +111,14 @@ export class AuthService {
         createdAt:   new Date().toISOString(),
       };
 
+      // Validar contraseña y hashear antes del batch para no tener async dentro
       this._validatePasswordStrength(password);
       const passwordHash = await this.passwordService.hash(password);
 
       const userId = crypto.randomUUID();
       const now    = new Date().toISOString();
 
+      // ✅ Registro atómico: tenant + usuario en una sola transacción D1 batch
       await this._createTenantAndUser(tenantData, {
         id:            userId,
         tenantId:      finalTenantId,
@@ -97,6 +152,7 @@ export class AuthService {
       };
 
     } else {
+      // ── INVITE-REGISTRATION ──────────────────────────────────────────────
       if (!finalTenantId) {
         throw new AuthError('tenant_id is required for invite registration', 400);
       }
@@ -117,6 +173,7 @@ export class AuthService {
         });
       }
 
+      // Verificar email único dentro del tenant
       const existingUser = await this.userRepo.findByEmail(email, finalTenantId);
       if (existingUser) {
         this._fireLog(ctx, null, finalTenantId, 'register_failed', ip, userAgent, {
@@ -162,6 +219,17 @@ export class AuthService {
     }
   }
 
+  /**
+   * Autenticar usuario con email + password.
+   * Requiere tenant_id en las credenciales para resolver al usuario correcto
+   * en el modelo email-único-por-tenant.
+   *
+   * @param {object} credentials
+   * @param {string}  credentials.email
+   * @param {string}  credentials.password
+   * @param {string}  credentials.tenantId  ← requerido (modelo por-tenant)
+   * @param {object} context
+   */
   async login(credentials, context) {
     const { email, password, tenantId } = credentials;
     const { ip, userAgent, ctx }        = context;
@@ -180,6 +248,7 @@ export class AuthService {
       throw new AuthError('Invalid credentials', 401);
     }
 
+    // Verificar tenant activo
     if (!this.userRepo.isTenantActive(user)) {
       this._fireLog(ctx, user.id, user.tenant_id, 'login_failed', ip, userAgent, {
         email,
@@ -188,6 +257,7 @@ export class AuthService {
       throw new AuthError('Account suspended. Contact administrator.', 403);
     }
 
+    // Verificar bloqueo de cuenta
     if (this.userRepo.isAccountLocked(user)) {
       this._fireLog(ctx, user.id, user.tenant_id, 'login_failed', ip, userAgent, {
         email,
@@ -196,6 +266,7 @@ export class AuthService {
       throw new AuthError(`Account locked until ${user.locked_until}`, 403);
     }
 
+    // Verificar contraseña
     const isValidPassword = await this.passwordService.verify(
       password,
       user.password_hash
@@ -210,8 +281,10 @@ export class AuthService {
       throw new AuthError('Invalid credentials', 401, { attempts_remaining: attemptsRemaining });
     }
 
+    // Reset intentos fallidos
     await this.userRepo.resetFailedAttempts(user.id);
 
+    // Generar tokens
     const { token: accessToken, jti } = await this.jwtService.generate({
       sub:    user.id,
       tenant: user.tenant_id,
@@ -243,10 +316,15 @@ export class AuthService {
         tenantId:   user.tenant_id,
         tenantName: user.tenant_name,
       },
-      expiresIn: 28800,
+      expiresIn: 28800, // 8 h
     };
   }
 
+  /**
+   * Renovar access token con rotación de refresh token.
+   * @param {string} refreshToken
+   * @param {object} context
+   */
   async refresh(refreshToken, context) {
     const { ip, userAgent, ctx } = context;
 
@@ -257,8 +335,10 @@ export class AuthService {
       throw new AuthError('Invalid or expired token', 401);
     }
 
+    // Revocar sesión anterior (token rotation)
     await this.sessionRepo.revoke(session.id);
 
+    // Generar nuevos tokens
     const { token: newAccessToken, jti: newJti } = await this.jwtService.generate({
       sub:    session.user_id,
       tenant: session.tenant_id,
@@ -287,6 +367,13 @@ export class AuthService {
     };
   }
 
+  /**
+   * Cerrar sesión del usuario actual (revoca solo la sesión del token presentado).
+   * Para revocar TODAS las sesiones del usuario, llamar logoutAll().
+   *
+   * @param {string} token - access token JWT
+   * @param {object} context
+   */
   async logout(token, context) {
     const { ip, userAgent, ctx } = context;
 
@@ -297,6 +384,7 @@ export class AuthService {
 
     const { payload } = verification;
 
+    // ✅ Revoca solo la sesión actual identificada por jti
     await this.sessionRepo.revokeByJti(payload.jti);
 
     this._fireLog(ctx, payload.sub, payload.tenant, 'logout', ip, userAgent, {});
@@ -304,6 +392,11 @@ export class AuthService {
     return { message: 'Logout successful' };
   }
 
+  /**
+   * Cerrar todas las sesiones del usuario (ej. "salir de todos los dispositivos").
+   * @param {string} token - access token JWT
+   * @param {object} context
+   */
   async logoutAll(token, context) {
     const { ip, userAgent, ctx } = context;
 
@@ -321,6 +414,11 @@ export class AuthService {
     return { message: 'All sessions revoked' };
   }
 
+  /**
+   * Verificar validez de un access token.
+   * @param {string} token
+   * @returns {{ valid: boolean, user?: object }}
+   */
   async verify(token) {
     const verification = await this.jwtService.verify(token);
     if (!verification.valid) {
@@ -329,6 +427,7 @@ export class AuthService {
 
     const { payload } = verification;
 
+    // Comprobar que la sesión no fue revocada
     const session = await this.sessionRepo.findByJti(payload.jti);
     if (!session) {
       return { valid: false };
@@ -350,6 +449,12 @@ export class AuthService {
     };
   }
 
+  // ── Private helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Crea tenant + usuario en una sola transacción D1 batch (atómica).
+   * Si cualquier INSERT falla, ninguno se persiste.
+   */
   async _createTenantAndUser(tenantData, userData) {
     const tenantStmt = this.tenantRepo.db
       .prepare(`
@@ -389,6 +494,7 @@ export class AuthService {
         userData.updatedAt,
       );
 
+    // ✅ D1 batch — ambas operaciones son atómicas
     await this.tenantRepo.db.batch([tenantStmt, userStmt]);
   }
 
@@ -407,6 +513,11 @@ export class AuthService {
     });
   }
 
+  /**
+   * Dispara un log de autenticación.
+   * Si se pasa ctx (CF Workers ExecutionContext), usa waitUntil para no
+   * bloquear el response al cliente.
+   */
   _fireLog(ctx, userId, tenantId, event, ip, userAgent, metadata) {
     const promise = this.authLogRepo.log({
       id:        crypto.randomUUID(),
@@ -420,8 +531,10 @@ export class AuthService {
     });
 
     if (ctx?.waitUntil) {
+      // ✅ No bloqueante: el response al cliente se envía sin esperar el log
       ctx.waitUntil(promise);
     } else {
+      // Fallback: await implícito (entornos sin ctx o tests)
       return promise;
     }
   }
@@ -433,10 +546,7 @@ export class AuthService {
     const hasUpper   = /[A-Z]/.test(password);
     const hasLower   = /[a-z]/.test(password);
     const hasNumber  = /\d/.test(password);
-    
-    // ✅ FIX: Regex expandido para incluir más símbolos comunes
-    // Incluye: ! @ # $ % ^ & * ( ) - _ = + [ ] { } \ | ; : ' " , . < > / ? `
-    const hasSpecial = /[!@#$%^&*()\-_=+\[\]{}\\|;:'",.<>/?`~]/.test(password);
+    const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
 
     if (!hasUpper || !hasLower || !hasNumber || !hasSpecial) {
       throw new AuthError(
