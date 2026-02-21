@@ -23,6 +23,16 @@ export class AuthRoutes {
 
     const { email, password, role, tenant_id, workspace_name } = body;
 
+// 👇 AÑADIR ESTE LOG:
+console.log('🔵 [AUTH-ROUTES] Campos extraídos del body:', {
+  email: email ? '✓' : '✗',
+  password: password ? '✓' : '✗',
+  tenant_id: tenant_id || 'null',
+  workspace_name: workspace_name || 'UNDEFINED',
+  role: role || 'null',
+  bodyKeys: Object.keys(body) // 👈 esto te muestra TODOS los campos que llegaron
+});
+
     console.log('🔵 [AUTH-ROUTES] Validando campos requeridos:', {
       hasEmail: !!email,
       hasPassword: !!password,
