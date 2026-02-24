@@ -21,6 +21,9 @@
 // ── Auth-module ───────────────────────────────────────────────────────────────
 import authWorker from './auth/worker.js';
 
+// ── Auth support (intercepta /auth/login antes del auth-module) ───────────────
+import { handleLogin } from './app/routes/auth-support.routes.js';
+
 // ── App middleware ────────────────────────────────────────────────────────────
 import { verifyAuth }          from './app/middleware/auth.js';
 import { corsPreflightResponse,
@@ -61,6 +64,14 @@ export default {
 
     // ── Auth (/auth/*) ────────────────────────────────────────────────────────
     if (path.startsWith('/auth')) {
+      // Interceptar /auth/login — resolvemos el tenant_id internamente
+      // antes de delegar al auth-module. El cliente nunca envía ni recibe
+      // tenant_ids.
+      if (method === 'POST' && path === '/auth/login') {
+        return handleLogin(request, env, authWorker);
+      }
+
+      // El resto de rutas /auth/* van directo al auth-module.
       const strippedPath    = path.slice(5) || '/';
       const rewrittenUrl    = new URL(request.url);
       rewrittenUrl.pathname = strippedPath;
