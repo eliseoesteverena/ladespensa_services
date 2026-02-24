@@ -93,9 +93,14 @@ export async function handleLogin(request, env, authWorker) {
   }
 
   // ── Delegar al auth-module con el tenant_id resuelto ─────────────────────
-  // Reconstruimos el request con el body completo que el auth-module espera.
-  const authBody    = JSON.stringify({ email, password, tenant_id: tenantId });
-  const authRequest = new Request(request.url, {
+  // El auth-module espera el path sin el prefijo /auth (ej: /login, no /auth/login).
+  // Reescribimos la URL quitando el prefijo antes de pasar el request.
+  const authBody = JSON.stringify({ email, password, tenant_id: tenantId });
+
+  const originalUrl  = new URL(request.url);
+  originalUrl.pathname = originalUrl.pathname.replace(/^\/auth/, '') || '/';
+
+  const authRequest = new Request(originalUrl.toString(), {
     method:  'POST',
     headers: request.headers,
     body:    authBody
