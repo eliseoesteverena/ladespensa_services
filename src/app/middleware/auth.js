@@ -37,14 +37,21 @@ export async function verifyAuth(request, env) {
     return unauthorized('Token expirado.', env.ALLOWED_ORIGINS);
   }
 
-  if (!payload.sub || !payload.tenant_id) {
+  // El auth-module usa nombres de claims propios (no el estándar RFC 7519).
+  // Según su documentación, /verify retorna { id, email, role, tenantId },
+  // lo que indica que el JWT emite 'userId' en lugar de 'sub'.
+  // Soportamos todas las variantes conocidas para máxima compatibilidad.
+  const userId   = payload.sub ?? payload.userId ?? payload.user_id ?? payload.id;
+  const tenantId = payload.tenantId ?? payload.tenant_id;
+
+  if (!userId || !tenantId) {
     return unauthorized('Token con claims incompletos.', env.ALLOWED_ORIGINS);
   }
 
   return {
-    userId:   payload.sub,
-    tenantId: payload.tenant_id,
-    role:     payload.role ?? 'member'
+    userId,
+    tenantId,
+    role: payload.role ?? 'member'
   };
 }
 
